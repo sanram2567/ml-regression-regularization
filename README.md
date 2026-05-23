@@ -2,7 +2,11 @@
 
 **Layer 1 · Classical ML | Dataset: California Housing | Week 1–2**
 
-> Regression pipeline progressing from EDA through regularised models, Bayesian uncertainty quantification, polynomial feature expansion, Optuna hyperparameter tuning, and SHAP interpretability — all built on a custom feature engineering pipeline.
+> End-to-end regression pipeline on the California Housing dataset covering EDA,
+> custom feature engineering, regularised linear models, Bayesian uncertainty
+> quantification, polynomial feature expansion, Optuna hyperparameter tuning,
+> SHAP interpretability, and robust regression — built as a production-grade
+> sklearn pipeline with zero data leakage.
 
 ---
 
@@ -11,7 +15,7 @@
 ```
 P2/
 ├── notebooks/
-│   └── finance_regression_updated.ipynb   ← main notebook (43 cells)
+│   └── finance_regression.ipynb
 ├── outputs/
 │   ├── 01_distributions.png
 │   ├── 02_correlation_heatmap.png
@@ -29,7 +33,8 @@ P2/
 │   ├── 14_shap_ridge_waterfall.png
 │   ├── 15_shap_poly_bar.png
 │   ├── 16_shap_poly_waterfall.png
-│   └── 17_shap_comparison.png
+│   ├── 17_shap_comparison.png
+│   └── huber_vs_ridge_residuals.png
 └── README.md
 ```
 
@@ -38,20 +43,18 @@ P2/
 ## Environment Setup
 
 ```bash
-python -m venv ml-regression-regularization
-source ml-regression-regularization/bin/activate        # Windows: p2_env\Scripts\activate
-
+python -m venv p2_env
+source p2_env/bin/activate        # Windows: p2_env\Scripts\activate
 pip install scikit-learn numpy pandas matplotlib seaborn scipy statsmodels
 pip install optuna shap
 ```
-
-**Tested on:** Python 3.10+ · scikit-learn 1.4+ · optuna 3.x · shap 0.45+
 
 ---
 
 ## Dataset
 
-**`sklearn.datasets.fetch_california_housing()`** — 20,640 rows × 8 features (1990 California census).
+**`sklearn.datasets.fetch_california_housing()`** — 20,640 rows × 8 features
+(1990 California census block groups).
 
 | Feature | Description |
 |---------|-------------|
@@ -62,176 +65,248 @@ pip install optuna shap
 | `Population` | Block group population |
 | `AveOccup` | Average household members |
 | `Latitude` / `Longitude` | Block group coordinates |
-| `MedHouseVal` *(target)* | Median house value ($100,000s) — **log1p-transformed** |
+| `MedHouseVal` *(target)* | Median house value ($100,000s) |
 
-### Outlier Removal Policy
+**Target transform:** `log1p(MedHouseVal)` — reduces skewness from 0.978 to 0.276.
+All predictions back-transformed with `expm1()` before computing metrics.
 
-Only physically impossible values removed — not IQR outliers indiscriminately:
+---
+
+## Data Cleaning
+
+Two-stage cleaning policy — physically impossible values removed before the split;
+data-driven filters applied to training data only after the split.
+
+### Stage 1 — Before split (domain knowledge, not model-derived)
 
 | Filter | Rows removed | Reason |
-|--------|-------------|--------|
-| `AveOccup >= 50` | 7 | Max was 1,243 people/household — census data entry error |
-| `AveRooms >= 50` | 9 | Max was 141.9 rooms/household average — impossible |
-| `AveBedrms >= 20` | 2 | Max was 34.1 bedrooms/household average — impossible |
-| **Total** | **16 rows (0.08%)** | Remaining 20,624 rows kept |
+|--------|:-----------:|--------|
+| `AveOccup >= 50` | 7 | Max 1,243 people/household — census entry error |
+| `AveRooms >= 50` | 9 | Max 141.9 rooms/household — impossible |
+| `AveBedrms >= 20` | 2 | Max 34.1 bedrooms/household — impossible |
+| **Total** | **16 (0.08%)** | 20,624 rows retained |
 
-High IQR counts in `AveBedrms` (6.9%) and `Population` (5.8%) are **not removed** — they reflect real skewed distributions, not data corruption. Skew is handled downstream by log-transforms and ratio features.
+### Stage 2 — Training set only, after split (data-driven)
+
+| Filter | Rows removed | Reason |
+|--------|:-----------:|--------|
+| `AveOccup < 1.0` AND `AveRooms > 15` | ~20–30 | Sparse vacation/seasonal blocks — structurally different market segment linear models cannot generalise |
+
+The test set is untouched — the model is evaluated on all samples including
+unusual ones, which is the correct production-equivalent setup.
 
 ---
 
 ## Feature Engineering Pipeline
 
-Custom `CaliforniaFeatureEngineer` transformer (sklearn-compatible `BaseEstimator` + `TransformerMixin`) adds 7 new features before modelling. KMeans geo-cluster is fit on training data only — no leakage.
+Custom `CaliforniaFeatureEngineer` (`BaseEstimator` + `TransformerMixin`).
+All transformers fit on training data only. KMeans geo-cluster fit on training
+coordinates only — no leakage.
 
-| Feature | Formula / Method | Rationale |
-|---------|-----------------|-----------|
-| `bedroom_ratio` | `AveBedrms / AveRooms` | Breaks 0.73 collinearity between AveRooms & AveBedrms |
-| `rooms_per_person` | `AveRooms / AveOccup` | Crowding index — captures density signal |
-| `income_rooms` | `MedInc × AveRooms` | Explicit interaction — 4th-highest SHAP feature |
-| `dist_to_LA` | Euclidean to (34.05, -118.24) | LA coastal premium |
-| `dist_to_SF` | Euclidean to (37.77, -122.42) | Bay Area premium |
-| `log_population` | `log1p(Population)` | Compresses right-skewed population outliers |
-| `log_ave_occup` | `log1p(AveOccup)` | Same — 3rd-highest SHAP feature |
-| `geo_cluster` | KMeans(k=12) on lat/lon → OHE | 12 spatial price zones → 11 dummy columns |
+| Feature | Formula | Rationale |
+|---------|---------|-----------|
+| `bedroom_ratio` | `AveBedrms / AveRooms` | De-correlates AveRooms & AveBedrms (r=0.73) |
+| `rooms_per_person` | `AveRooms / AveOccup` | Crowding index |
+| `income_rooms` | `MedInc × AveRooms` | Explicit interaction — 2nd-highest SHAP feature |
+| `dist_to_LA` | Euclidean to (34.05, −118.24) | LA coastal premium |
+| `dist_to_SF` | Euclidean to (37.77, −122.42) | Bay Area premium |
+| `log_population` | `log1p(Population)` | Compresses right-skewed population |
+| `log_ave_occup` | `log1p(AveOccup)` | 3rd-highest SHAP feature |
+| `log_ave_rooms` | `log1p(AveRooms)` | Compresses right skew (skew > 4) |
+| `log_ave_bedrms` | `log1p(AveBedrms)` | Same |
+| `geo_cluster` | KMeans(k=20) on lat/lon → OHE | 20 spatial price zones → 19 dummy columns |
 
-**Result:** 8 raw features → 26 engineered features (15 numeric + 11 OHE geo-cluster dummies).
+**Result:** 8 raw → 28 numeric + 19 OHE = **47 engineered features** fed into
+the ColumnTransformer; StandardScaler applied to all numeric features.
 
 ---
 
-## Results
+## Complete Results
 
-### Baseline vs Engineered Features
+> All R² and RMSE/MAE computed on the **test set** using back-transformed
+> (`expm1`) predictions. RMSE and MAE are in USD.
+
+### Baseline vs Engineered (4 shared models)
 
 | Model | Baseline RMSE ($) | Engineered RMSE ($) | Improvement |
 |-------|:-----------------:|:-------------------:|:-----------:|
-| OLS | 73,912 | 69,938 | −$3,974 |
-| Ridge (RidgeCV) | 73,941 | 70,443 | −$3,498 |
-| Lasso (LassoCV) | 73,897 | 70,695 | −$3,202 |
-| ElasticNet | 73,899 | 70,276 | −$3,623 |
+| OLS | 73,912 | 72,638 | −$1,274 |
+| Ridge | 73,941 | 72,640 | −$1,301 |
+| Lasso | 73,897 | 73,129 | −$768 |
+| ElasticNet | 73,899 | 72,832 | −$1,067 |
 
-> Feature engineering alone reduced OLS RMSE by **~$4,000** without touching the model.
+Feature engineering contributed a modest ~$1,000–1,300 RMSE reduction for linear
+models. The dominant gain comes from polynomial feature expansion (see below).
 
 ---
 
-### Full Model Comparison (Engineered Features)
+### All Models — Full Comparison
 
-| Model | RMSE ($) | MAE ($) | R² | Notes |
-|-------|:--------:|:-------:|:--:|-------|
-| OLS (baseline) | 69,938 | 44,552 | 0.630 | No regularisation, all 26 features |
-| Ridge (RidgeCV) | 70,443 | 44,569 | 0.624 | α = 3.45, L2 shrinkage |
-| Lasso (LassoCV) | 70,695 | 44,593 | 0.622 | α = 0.0001, zeroed 1 feature (`geo_cluster_7`) |
-| ElasticNet | 70,276 | 44,561 | 0.626 | α = 0.0001, l1_ratio = 0.019 |
-| BayesianRidge | 70,169 | 44,559 | 0.621 | 95% PI coverage = **93.8%** |
-| **Poly(2)+Ridge** | **56,919** | **38,688** | **0.755** | 135 poly + 11 OHE = 146 features, α = 27.05 |
+| Section | Model | RMSE ($) | MAE ($) | R² | Notes |
+|---------|-------|:--------:|:-------:|:--:|-------|
+| Baseline | OLS | 73,912 | 49,821 | 0.587 | 8 raw features |
+| Baseline | Ridge (RidgeCV) | 73,941 | 49,833 | 0.586 | α = 6.593 |
+| Baseline | Lasso (LassoCV) | 73,897 | 49,850 | 0.587 | α = 0.00026 |
+| Baseline | ElasticNet | 73,899 | 49,850 | 0.587 | α = 0.00029 |
+| Engineered | OLS | 72,638 | 43,444 | 0.601 | 26 engineered features |
+| Engineered | Ridge (RidgeCV) | 72,640 | 43,447 | 0.601 | α = 0.055 |
+| Engineered | Lasso (LassoCV) | 73,129 | 43,650 | 0.595 | Zeroed: `geo_cluster_7` |
+| Engineered | ElasticNet | 72,832 | 43,523 | 0.599 | l1_ratio = 0.019 (≈ Ridge) |
+| Engineered | BayesianRidge | 72,770 | 43,502 | 0.599 | 95% PI coverage = 93.8% |
+| Engineered | **Poly(2)+Ridge** | **56,346** | **38,411** | **0.760** | 146 features, α = 27.05 |
+| Optuna | Ridge | 72,640 | — | — | α = 0.057 |
+| Optuna | Lasso | 73,128 | — | — | α = 0.0001 |
+| Optuna | ElasticNet | 72,840 | — | — | α = 0.00013, l1_ratio = 0.023 |
+| Optuna | BayesianRidge | 72,727 | — | — | 95% PI coverage = 93.8% |
+| Robust | HuberRegressor (ε=2.0) | 85,923 | 43,637 | 0.441 | RobustScaler |
 
-> **Poly(2)+Ridge** delivers a **19.2% RMSE reduction** over linear Ridge — the single biggest model-level gain.
+---
+
+### Polynomial Feature Expansion — Key Result
+
+| Metric | Linear Ridge | Poly(2)+Ridge | Change |
+|--------|:------------:|:-------------:|:------:|
+| RMSE ($) | 72,640 | 56,346 | **−22.4%** |
+| MAE ($) | 43,447 | 38,411 | **−11.6%** |
+| R² | 0.601 | 0.760 | **+0.159** |
+| Features | 26 | 146 | +120 poly terms |
+
+The polynomial expansion is the single largest performance gain in the project.
+Polynomial terms capture non-linear relationships (MedInc curve, geographic
+interactions) that linear Ridge cannot express regardless of regularisation strength.
 
 ---
 
 ### Lasso Feature Selection
 
-At the LassoCV-chosen alpha (0.0001), only **1 of 26 features** was zeroed: `geo_cluster_7`.
-All 15 engineered numeric features and 10 of 11 geo-cluster dummies remained active —
-confirming the feature engineering step produced genuinely useful signal throughout.
+At best alpha (0.00010), Lasso zeroed **1 of 26 features**: `geo_cluster_7`.
+
+This cluster carries no additional price signal beyond what the other spatial
+features and geo-cluster dummies already capture. All 25 remaining features —
+including all engineered numeric features — were retained as active predictors,
+confirming the feature engineering step produced useful non-redundant signal.
 
 ---
 
 ### BayesianRidge — 95% Prediction Interval Coverage
 
+**Delta method for log1p transform:**
+```python
+# y = log1p(x)  →  dx/dy = exp(y) = y_pred + 1
+y_std = y_std_log * (y_pred + 1)
+```
+
 | Metric | Value |
 |--------|-------|
-| Empirical coverage | **93.8%** |
+| Empirical 95% coverage | **93.8%** |
 | Target | 95.0% |
-| Gap | −1.2% (slightly overconfident) |
+| Gap | −1.2% |
 
-**Coverage by prediction decile** — miscalibration is concentrated in the upper half of predictions (expensive homes):
+**Coverage by decile:**
 
-| Decile | Coverage | Interpretation |
-|--------|:--------:|---------------|
-| 0 (cheapest) | 94.4% | Well calibrated |
-| 1–4 | 95.6–97.6% | Slightly wide intervals |
-| 5–6 | 91.3–92.5% | Mild overconfidence |
-| 7–8 | 88.1–90.6% | Meaningful overconfidence |
-| 9 (most expensive) | 94.2% | Recovers at very top |
+| Decile | Coverage | Decile | Coverage |
+|--------|:--------:|--------|:--------:|
+| 0 (cheapest) | 94.4% | 5 | 92.5% |
+| 1 | 97.1% | 6 | 91.3% |
+| 2 | 97.6% | 7 | 90.6% |
+| 3 | 96.6% | **8** | **88.1%** |
+| 4 | 95.9% | 9 (priciest) | 94.2% |
 
-> The model is most uncertain about mid-to-high value homes, likely due to the $500K cap in the dataset creating a spike that the Gaussian posterior struggles to model.
-
----
-
-### Residual Diagnostics (Poly(2)+Ridge)
-
-| Statistic | Value | Ideal |
-|-----------|-------|-------|
-| Residual mean | 0.0 | ≈ 0 ✓ |
-| Residual std | 0.6 | — |
-| Residual skew | 0.987 | ≈ 0 ✗ |
-| Residual kurtosis | 4.972 | ≈ 0 ✗ |
-
-Positive skew and heavy kurtosis reflect the **$500K ceiling effect** in California Housing — a structural data truncation artifact, not a modelling failure. The log1p transform reduces but cannot eliminate this.
+Coverage weakest at decile 8 — the $500K ceiling in the dataset creates a
+non-Gaussian spike that the Gaussian posterior underestimates.
 
 ---
 
 ### Optuna Hyperparameter Tuning
 
-80 trials × 5-fold CV per model using TPE (Tree-structured Parzen Estimator) sampler.
+80 trials × 5-fold CV, TPE sampler. Gain vs sklearn CV:
 
-| Model | sklearn CV RMSE ($) | Optuna RMSE ($) | Gain |
-|-------|:-------------------:|:---------------:|:----:|
-| Ridge | 70,443 | 70,418 | +$25 |
-| Lasso | 70,695 | 70,697 | −$2 |
-| ElasticNet | 70,276 | 70,477 | −$201 |
-| BayesianRidge | 70,169 | 70,170 | −$2 |
+| Model | sklearn RMSE ($) | Optuna RMSE ($) | Gain ($) |
+|-------|:----------------:|:---------------:|:--------:|
+| Ridge | 72,640 | 72,640 | 0 |
+| Lasso | 73,129 | 73,128 | +1 |
+| ElasticNet | 72,832 | 72,840 | −8 |
+| BayesianRidge | 72,770 | 72,727 | +43 |
 
-**Finding:** sklearn's RidgeCV / LassoCV already explore the hyperparameter space efficiently for single-parameter models. Optuna's advantage is most visible for **ElasticNet** (2 params) and more complex architectures. For linear models with a well-chosen alpha grid, sklearn CV is already near-optimal.
-
-**Best Optuna parameters:**
-
-| Model | Parameter | Value |
-|-------|-----------|-------|
-| Ridge | alpha | 3.273 |
-| Lasso | alpha | 0.0001 |
-| ElasticNet | alpha | 0.000213 |
-| ElasticNet | l1_ratio | 0.019 |
-| BayesianRidge | alpha_1 | 9.82e-02 |
-| BayesianRidge | alpha_2 | 1.08e-07 |
-| BayesianRidge | lambda_1 | 9.99e-02 |
-| BayesianRidge | lambda_2 | 5.52e-06 |
+sklearn's RidgeCV / LassoCV are already near-optimal for single-parameter linear
+models. Optuna's value was in confirming ElasticNet collapses to Ridge
+(l1_ratio = 0.023) — a region outside sklearn's fixed grid of [0.1, 0.3, 0.5, 0.7, 0.9].
 
 ---
 
-### SHAP Feature Importance
+### Residual Diagnostics — Poly(2)+Ridge
 
-`LinearExplainer` (exact, no sampling) on Optuna-tuned Ridge and Poly(2)+Ridge.
+| Statistic | Value | Ideal | Interpretation |
+|-----------|:-----:|:-----:|----------------|
+| Mean | 0.0 | ≈ 0 | ✓ Unbiased |
+| Std | 0.6 | — | — |
+| Skew | 0.987 | ≈ 0 | ✗ Underestimates expensive homes |
+| Kurtosis | 4.972 | ≈ 0 | ✗ Heavy tails from $500K ceiling |
 
-#### Ridge — Top features by mean |SHAP|
+Skew and kurtosis reflect the structural $500K cap in California Housing — not
+a modelling error. The log1p transform reduces but cannot eliminate this artifact.
+
+---
+
+### HuberRegressor — Note on Results
+
+HuberRegressor with RobustScaler produced RMSE $85,923 — worse than all other
+models. The cause: Huber's robustness to large residuals is its strength for
+RMSE, but the RobustScaler on the engineered feature matrix (which already
+includes log-compressed features) introduced scaling inconsistencies. The
+best epsilon found was 2.0 — at the edge of the search range — suggesting
+the optimal epsilon may lie outside [1.1, 2.0] for this specific feature
+matrix, or that StandardScaler is a better pairing with Huber here.
+MAE ($43,637) is comparable to Ridge ($43,447) — confirming the model's
+point predictions are reasonable; the RMSE penalty comes from a few
+large errors that Huber's linear loss still cannot eliminate on this dataset.
+
+---
+
+### SHAP Feature Importance — Ridge (Engineered)
 
 | Rank | Feature | Mean \|SHAP\| | Direction |
 |------|---------|:------------:|-----------|
-| 1 | `MedInc` | 0.0751 | High income → price UP |
-| 2 | `income_rooms` | 0.0467 | Engineered: wealth × space → price UP |
-| 3 | `log_ave_occup` | 0.0346 | High occupancy → price DOWN |
-| 4 | `Latitude` | 0.0312 | Higher latitude (NorCal) → price UP |
-| 5 | `dist_to_LA` | 0.0246 | Far from LA → price DOWN |
-| 6 | `rooms_per_person` | 0.0235 | More space per person → price UP |
-| 7 | `Longitude` | 0.0220 | Coastal (more negative) → price UP |
-| 8 | `HouseAge` | 0.0186 | Older homes in desirable areas → price UP |
+| 1 | `MedInc` | 0.075 | High income → price UP |
+| 2 | `income_rooms` | 0.048 | Wealth × space → price UP |
+| 3 | `log_ave_occup` | 0.035 | High occupancy → price DOWN |
+| 4 | `Latitude` | 0.031 | Higher latitude (NorCal) → price UP |
+| 5 | `rooms_per_person` | 0.026 | More space per person → price UP |
+| 6 | `dist_to_LA` | 0.025 | Far from LA → price DOWN |
+| 7 | `Longitude` | 0.022 | Coastal → price UP |
+| 8 | `HouseAge` | 0.018 | Older homes in desirable areas → price UP |
 
-#### Poly(2)+Ridge vs Ridge — Amplification ratios
+`income_rooms` (engineered) ranks 2nd above all geographic features —
+confirms the explicit interaction term captured signal beyond raw `MedInc` alone.
 
-| Feature | Ridge \|SHAP\| | Poly \|SHAP\| | Ratio |
-|---------|:-------------:|:------------:|:-----:|
-| `bedroom_ratio` | 0.0135 | 0.0327 | **2.42×** — largest amplification |
-| `dist_to_LA` | 0.0246 | 0.0464 | **1.89×** |
-| `AveRooms` | 0.0113 | 0.0213 | **1.89×** |
-| `HouseAge` | 0.0186 | 0.0297 | **1.60×** |
-| `AveOccup` | 0.0170 | 0.0256 | **1.51×** |
-| `Latitude` | 0.0312 | 0.0433 | 1.39× |
-| `MedInc` | 0.0751 | 0.0702 | 0.93× *(linear form better)* |
+### Poly(2)+Ridge vs Ridge — Feature Amplification
 
-> Features with ratio > 1 gain explanatory power through polynomial interactions.
-> `bedroom_ratio` (2.42×) and `dist_to_LA` (1.89×) benefit most — their non-linear
-> and interaction effects matter more than their linear signals alone.
-> `MedInc` (0.93×) is already near-linear in its relationship with price.
+| Feature | Ratio | Interpretation |
+|---------|:-----:|----------------|
+| `dist_to_SF` | **3.78×** | Bay Area premium is strongly non-linear |
+| `dist_to_LA` | **1.93×** | Distance-to-coast effect has a threshold |
+| `AveRooms` | **1.86×** | Room count interacts with other features |
+| `HouseAge` | **1.66×** | Age matters more in context of location |
+| `MedInc` | 0.95× | Already near-linear — polynomial adds little |
+
+---
+
+### Known Limitation — Sample 2530
+
+| Feature | Value |
+|---------|-------|
+| `AveOccup` | 0.69 (fewer residents than units) |
+| `AveRooms` | 28.6 |
+| `Population` | 27 |
+| `MedHouseVal` | $83,000 |
+| Ridge predicted | ~$770,000 |
+
+A sparse vacation/seasonal property block — large homes, almost no permanent
+residents, low price. Post-scaling `rooms_per_person` reaches z = 46.65,
+catastrophically outside the training distribution. The linear model
+extrapolates the learned relationship (high rooms → high price) to an absurd
+degree. This is irreducible error for any linear model and the primary
+motivation for tree-based models in P3, which isolate this region in a leaf node.
 
 ---
 
@@ -239,9 +314,13 @@ Positive skew and heavy kurtosis reflect the **$500K ceiling effect** in Califor
 
 | Topic | Finding |
 |-------|---------|
-| **Feature engineering** | Reduced OLS RMSE by $4K (~5%) before touching any model — biggest single lever |
-| **Regularisation** | Lasso zeroed only 1 of 26 features — engineered matrix is clean, low-redundancy |
-| **Polynomial expansion** | 19.2% RMSE reduction over linear Ridge — strongest model improvement |
-| **Bayesian uncertainty** | 93.8% empirical coverage vs 95% target — slight overconfidence in mid-high price range |
-| **Optuna vs sklearn CV** | Negligible gain for single-param linear models; increases in value with model complexity |
-| **SHAP** | `MedInc` is the dominant predictor; engineered features `income_rooms` and `log_ave_occup` rank 2nd and 3rd — validates the feature engineering choices |
+| **Feature engineering** | ~$1,300 RMSE gain for linear models — modest but meaningful |
+| **Polynomial expansion** | 22.4% RMSE reduction — single largest gain in the project |
+| **Regularisation** | All linear models cluster within $500 — feature matrix matters more than model choice |
+| **Lasso selection** | 1 of 26 zeroed (`geo_cluster_7`) — engineered matrix is efficient |
+| **Bayesian coverage** | 93.8% vs 95% target — weakest at decile 8 due to $500K ceiling |
+| **Delta method** | Correct form: `y_std * (y_pred + 1)` — explicit about log1p +1 offset |
+| **Optuna** | Negligible gain for linear models — confirmed ElasticNet collapses to Ridge |
+| **Huber** | RMSE worse than Ridge — MAE comparable; RobustScaler pairing needs revisiting |
+| **SHAP** | `dist_to_SF` 3.78× poly amplification — strongest non-linearity signal |
+| **Irreducible error** | Vacation-block sample cannot be fixed linearly — motivates P3 |

@@ -1,4 +1,4 @@
-# P2 — Finance Regression: Regularization & Uncertainty
+# Finance Regression: Regularization & Uncertainty
 
 **Layer 1 · Classical ML | Dataset: California Housing | Week 1–2**
 
